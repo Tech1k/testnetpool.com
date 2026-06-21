@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local configs hold RPC credentials - don't commit them (config.example.toml is
+# the committed, credential-free reference)
+config.toml
+config.*.toml
+!config.example.toml
+
+# SQLite accounting databases (one per coin)
+*.db
+*.db-wal
+*.db-shm
+
+dist/
+build/
+*.egg-info/

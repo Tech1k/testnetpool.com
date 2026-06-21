@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "testnetpool"
+dynamic = ["version"]   # read from testnetpool/__init__.py (the single source of truth)
+description = "A lean, self-hostable Stratum mining pool for Bitcoin, Litecoin, and Monero testnets (solo or PPLNS)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Tech1k" }]
+keywords = ["bitcoin", "litecoin", "monero", "stratum", "cryptonote", "mining", "pool", "pplns", "solo", "testnet"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Office/Business :: Financial",
+]
+# Zero third-party runtime dependencies - pure standard library.
+dependencies = []
+
+[project.urls]
+Homepage = "https://testnetpool.com"
+Author = "https://tech1k.com"
+Source = "https://github.com/Tech1k/testnetpool.com"
+Issues = "https://github.com/Tech1k/testnetpool.com/issues"
+Changelog = "https://github.com/Tech1k/testnetpool.com/releases"   # release notes = the changelog
+
+[project.scripts]
+testnetpool = "testnetpool.__main__:main"
+
+[tool.hatch.version]
+path = "testnetpool/__init__.py"   # the dynamic version comes from __version__ here
+
+[tool.hatch.build.targets.wheel]
+packages = ["testnetpool"]
+
+[tool.hatch.build.targets.sdist]
+include = ["testnetpool", "tests", "contrib", "config.example.toml", "*.md", "LICENSE"]

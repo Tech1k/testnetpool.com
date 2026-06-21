@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Zero third-party deps: nothing to install. Run the consensus self-tests + the
+      # plain-script suite; fail the job if any single test script exits non-zero.
+      - name: Self-tests (consensus + accounting)
+        run: python -m testnetpool --selftest
+      - name: Test suite
+        run: |
+          fail=0
+          for t in tests/*.py; do
+            echo "::group::$t"
+            python "$t" || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail

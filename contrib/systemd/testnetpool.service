@@ -1,0 +1,41 @@
+# One process, every coin - the default (hub) deployment. Put all your coins in one
+#   /etc/testnetpool/config.toml   (the [[coins]] format; see config.example.toml)
+# then:  systemctl enable --now testnetpool
+# Prefer a separate process per coin? Use testnetpool@.service instead.
+# See the README (Deploying) for the full setup.
+
+[Unit]
+Description=TestnetPool mining pool
+Documentation=https://github.com/Tech1k/testnetpool.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testnetpool
+Group=testnetpool
+# Run the installed package (pip install testnetpool) or point at a venv python.
+ExecStart=/usr/bin/python3 -m testnetpool -c /etc/testnetpool/config.toml
+Restart=on-failure
+RestartSec=5
+
+# pool databases + state live here (auto-created, owned by the service user).
+StateDirectory=testnetpool
+WorkingDirectory=/var/lib/testnetpool
+
+# Hardening - the pool only needs the network and its state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/testnetpool
+
+[Install]
+WantedBy=multi-user.target
