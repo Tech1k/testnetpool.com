@@ -2719,21 +2719,35 @@ class StatsServer:
         }
 
     def _healthz(self):
-        """Healthy iff every pool has a recent block template (the node is reachable
-        and we're producing jobs). 200 when all fresh, else 503 - usable by systemd
-        WatchdogSec, a load balancer, or an uptime monitor."""
+        """Healthy iff every pool has produced a template AND reached its node recently. 200 when
+        all OK, else 503 - usable by systemd WatchdogSec, a load balancer, or an uptime monitor.
+        Keyed on the last successful node POLL, not the last NEW template: a healthy pool can go
+        many minutes between blocks (Bitcoin testnet especially, and with template_refresh=0 there
+        is no idle rebuild), yet it still polls the node every block_poll_interval - so a stale
+        node-contact, not a stale template, is the real trouble signal. (The old template-age test
+        false-503'd on every normal inter-block gap under the recommended production posture.)"""
         now = time.time()
         coins, healthy = [], True
         for p in self.pools:
-            ts = getattr(p, "last_template_ts", 0.0)
-            age = (now - ts) if ts else None
-            # Stale if no fresh template in 6x the refresh interval (min 5 min).
-            thr = max(300.0, 6 * getattr(p.cfg, "template_refresh", 30.0))
-            ok = age is not None and age < thr
+            contact = getattr(p, "last_node_contact", 0.0)
+            has_template = getattr(p, "last_template_ts", 0.0) > 0
+            age = (now - contact) if contact else None
+            # Allow a few missed polls before unhealthy. Contact cadence is one
+            # block_poll_interval in poll/ZMQ mode, or up to the longpoll timeout in longpoll mode
+            # (template_refresh, or 600s when rebuilding on-block-only). Monero always polls.
+            poll = getattr(p.cfg, "block_poll_interval", 30.0) or 30.0
+            tref = getattr(p.cfg, "template_refresh", 30.0)
+            gap = (tref if tref > 0 else 600.0) if getattr(p.cfg, "longpoll", False) else poll
+            thr = max(120.0, 3 * gap)
+            ok = has_template and age is not None and age < thr
             healthy = healthy and ok
-            coins.append({"coin": p.cfg.coin, "chain": p.cfg.chain,
-                          "template_age_seconds": round(age, 1) if age is not None else None,
-                          "ok": ok})
+            coins.append({
+                "coin": p.cfg.coin, "chain": p.cfg.chain,
+                "node_contact_age_seconds": round(age, 1) if age is not None else None,
+                "template_age_seconds": (round(now - p.last_template_ts, 1)
+                                         if getattr(p, "last_template_ts", 0) else None),
+                "ok": ok,
+            })
         body = json.dumps({"ok": healthy, "coins": coins}, indent=2).encode()
         status = b"HTTP/1.1 200 OK\r\n" if healthy else b"HTTP/1.1 503 Service Unavailable\r\n"
         return body, "application/json", status

@@ -497,7 +497,19 @@ class Accounting:
                 )
         return swept
 
-    def prune_shares(self, before_ts: int, keep_recent: int, chunk: int = 20000) -> int:
+    def shares_keep_floor(self, keep_recent: int) -> int | None:
+        """The id of the ``keep_recent``-th most-recent share: everything with a smaller id is
+        beyond the retained PPLNS window. None when there are fewer than ``keep_recent`` rows.
+        A chunked prune drain computes this ONCE and passes it to each prune_shares call so the
+        OFFSET scan doesn't re-run per chunk (a floor from the drain's start only keeps MORE
+        recent rows than a re-read would as new shares arrive, so it never over-deletes)."""
+        row = self.conn.execute(
+            "SELECT id FROM shares ORDER BY id DESC LIMIT 1 OFFSET ?", (keep_recent,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def prune_shares(self, before_ts: int, keep_recent: int, chunk: int = 20000,
+                     floor_id: int | None = None) -> int:
         """Bound the otherwise insert-only shares table. Deletes shares older than
         ``before_ts`` but ALWAYS keeps the ``keep_recent`` most-recent rows (one full
         PPLNS window) regardless of age, and never touches anything newer than
@@ -509,17 +521,16 @@ class Accounting:
         whole pool. A return of exactly ``chunk`` means more remain; the maintenance loop drains
         the rest on later cycles (or in a yielding loop)."""
         with self.conn:
-            # The id of the keep_recent-th most-recent share: everything with a smaller
-            # id is beyond the retained window and eligible (if also old enough).
-            row = self.conn.execute(
-                "SELECT id FROM shares ORDER BY id DESC LIMIT 1 OFFSET ?", (keep_recent,)
-            ).fetchone()
-            if row is None:
-                return 0  # fewer than keep_recent rows total - keep everything
+            # Keep-floor: everything with a smaller id is beyond the retained PPLNS window. A
+            # drain loop passes a precomputed floor_id so this OFFSET scan runs once, not per chunk.
+            if floor_id is None:
+                floor_id = self.shares_keep_floor(keep_recent)
+                if floor_id is None:
+                    return 0  # fewer than keep_recent rows total - keep everything
             cur = self.conn.execute(
                 "DELETE FROM shares WHERE id IN ("
                 "  SELECT id FROM shares WHERE ts < ? AND id <= ? ORDER BY id LIMIT ?)",
-                (int(before_ts), row[0], int(chunk)))
+                (int(before_ts), floor_id, int(chunk)))
             return cur.rowcount
 
     # -- Layer 4: read queries for the JSON API -----------------------------

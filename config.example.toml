@@ -1,144 +1,72 @@
-# TestnetPool - example configuration.
+# TestnetPool - example configuration (HUB format: one process + dashboard, any number of coins).
 #
-# This is the HUB format: one process, one dashboard/JSON API, any number of
-# coins. It is the one config to start from - running a SINGLE coin is just one
-# [[coins]] entry (delete the rest). (A simpler [network]/[pool] single-coin form
-# is also supported by the code, but everything here is doable in this format.)
-#
-# Copy to config.toml and edit, then:
 #   python3 -m testnetpool -c config.toml          # run
 #   python3 -m testnetpool -c config.toml --check  # validate + list the coins
 #
-# Config files hold RPC credentials - config.toml is gitignored. Keep node RPC
-# bound to 127.0.0.1 and put a reverse proxy in front of [stats] for public use.
-#
-# What is SHARED vs PER-COIN:
-#   SHARED  : the process, the dashboard ([stats]), the JSON API, [defaults],
-#             the [public] payout economics, and [donate].
-#   PER-COIN: each [[coins]] table - its own node/RPC, a Stratum PORT, and a
-#             database. A mining connection speaks one coin, so miners choose a
-#             coin by connecting to that coin's port.
+# Copy to config.toml (gitignored; it holds RPC credentials) and edit. Keep node RPC on
+# 127.0.0.1 and reverse-proxy [stats] for public use. SHARED across coins: [stats], [defaults],
+# [public], [donate]. PER-COIN: each [[coins]] table (own node/RPC, Stratum port, database) - a
+# connection mines the one coin of the port it hit. For a single coin, keep one [[coins]] entry.
 
-# ---------------------------------------------------------------------------
-# The one shared dashboard + JSON API.
-# ---------------------------------------------------------------------------
+# === Shared dashboard + JSON API ===========================================
 [stats]
 enabled = true
-host = "127.0.0.1"     # put a reverse proxy in front for public exposure
+host = "127.0.0.1"     # reverse-proxy this for public exposure
 port = 8080
-# Per-IP HTTP rate limit (requests/minute; 0 = off). Defaults to 120, which is
-# generous for browsers (the dashboard polls /api/stats every 30s) + normal API use.
-# Behind a local reverse proxy the client IP is taken from X-Forwarded-For; /healthz
-# is exempt so uptime monitors are never throttled.
-# rate_limit_per_min = 120
-# Public URL of the dashboard. Setting it turns on social/OG share cards and lets
-# search engines index the site; leave blank for a private/staging instance (stays
-# noindex, no absolute-URL tags).
-# site_url = "https://testnetpool.com"
-# Optional link in the footer to an external node-status page (e.g. your
-# simple-node-dashboard). Blank = no link.
-# node_dashboard_url = "https://node.testnetpool.com"
-# Tor: your v3 .onion (bare address or full URL). Adds a footer ".onion" link and
-# sends an Onion-Location header so Tor Browser offers the mirror automatically.
-# Run the hidden service in torrc pointing at this dashboard (see the README, Deploying).
-# onion = "abcd...xyz.onion"
+site_url = "https://testnetpool.com"   # enables share cards + indexing; blank = private/noindex
+# rate_limit_per_min = 120                              # per-IP HTTP limit (0 = off); /healthz exempt
+# node_dashboard_url = "https://node.testnetpool.com"   # footer link to an external node-status page
+# onion = "abcd...xyz.onion"                            # v3 .onion -> footer link + Onion-Location header
 
-# ---------------------------------------------------------------------------
-# Defaults applied to every coin unless that coin overrides them. Anything you
-# would otherwise repeat in each [[coins]] entry goes here.
-# ---------------------------------------------------------------------------
+# === Defaults (every coin inherits these; override per-coin) ===============
 [defaults]
 mode = "public"                       # "public" (PPLNS payouts) or "solo"
 stratum_host = "0.0.0.0"
 coinbase_tag = "/TestnetPool.com/"    # stamped on-chain in every block; make it your own
-# false (default): mine coinbase-only blocks. Simplest; forfeits the small
-#   tx-fee portion. NOTE: post-MWEB chains (Litecoin testnet/mainnet) auto-
-#   upgrade to FULL MWEB blocks here regardless - a coinbase-only block would be
-#   rejected "mweb-missing".
-# true: always include mempool + MWEB transactions and collect fees.
+# include_transactions: false (default) = coinbase-only blocks (forfeits the small fee portion);
+# true = include mempool txs + collect fees. Post-MWEB chains (Litecoin) build full MWEB blocks
+# regardless, since a coinbase-only block would be rejected "mweb-missing".
 include_transactions = false
-
-# Abuse control. An IP whose shares are almost all rejects gets dropped, and an IP
-# that keeps earning those drops is temp-banned automatically - this is always on,
-# nothing to configure. These cap simultaneous connections (0 = unlimited). The
-# per-IP cap defaults to 100 (a public endpoint shouldn't let one IP open unlimited
-# sockets; 100 is well above any real farm/NAT). The total cap is off by default -
-# set it to match your file-descriptor ulimit if you expect very high load.
-#
-# IMPORTANT for rental proxies (MiningRigRentals / NiceHash): all rented rigs reach the
-# pool through the PROXY's single source IP, so the per-IP cap applies to ALL of them at
-# once. If you expect to rent >100 rigs, raise max_conns_per_ip (or set it to 0) or they
-# get connection-refused. The pool logs a throttled WARNING naming this when it triggers.
+# Connection caps (0 = unlimited; per-IP defaults to 100). Rental proxies (MRR/NiceHash) funnel
+# all rigs through one IP, so raise max_conns_per_ip (or set 0) when renting >100 rigs. Abuse
+# control (drop + temp-ban IPs that mostly submit rejects) is always on, nothing to configure.
 # max_conns_per_ip = 100
 # max_conns_total = 0
+# block_webhook_url = "https://your-server.example/hooks/block"   # POST {height,hash,reward,coin} on a block
 
-# Optional: POST a small JSON body when a block is found (height, hash, reward,
-# coin/chain - no miner data). Point it at anything that accepts a POST - your own
-# endpoint, a script behind a tiny HTTP server, a self-hosted relay. Best-effort;
-# a slow/failing endpoint never delays mining. Empty = off.
-# block_webhook_url = "https://your-server.example/hooks/block"
-
-# Self-tuning per-miner difficulty. Most miners never touch it:
-#   - Small / CPU miners: just connect. Vardiff watches the share rate and converges on the
-#     right difficulty on its own (ramps up for a fast rig, down for a quiet one).
-#   - Big ASICs / rental proxies (MiningRigRentals, NiceHash): these PIN a difficulty via the
-#     worker password ("d=<n>") so their firmware accepts the work, which disables vardiff for
-#     that worker. Set it to match the rig:  d = hashrate(H/s) * target_time(s) / hashes_per_diff1
-#     (hashes_per_diff1 = 2^16 for scrypt/Litecoin, 2^32 for sha256d/Bitcoin). E.g. a 1.4 MH/s
-#     scrypt rig at a 15 s/share target -> d = 1.4e6 * 15 / 65536 ~= 320. If a pin is WAY too
-#     high for the rig (e.g. MRR defaulting d=8000000 onto a small rig -> ~4 days per share),
-#     the rig finds nothing; the pool notices a pinned worker producing no shares for a full
-#     idle window, logs a warning, and relaxes the pin so vardiff can take over.
-#   - max_difficulty caps how high a pin (or vardiff) can go - keep it above your biggest rig.
-# A coin may override any of this with its own [coins.vardiff].
+# Self-tuning per-miner difficulty. CPU/small miners just connect (vardiff converges). ASICs and
+# rental proxies PIN it via the worker password "d=<n>" (disables vardiff for that worker):
+# d = hashrate(H/s) * target_time / hashes_per_diff1  (hashes_per_diff1 = 2^16 scrypt, 2^32 sha256d).
+# A pin too high for the rig self-relaxes after an idle window. max_difficulty caps any pin.
 [defaults.vardiff]
 enabled = true
 start_difficulty = 16384
 min_difficulty = 1024
 max_difficulty = 16777216
 target_time = 15.0       # aim for one share every N seconds per miner
-retarget_time = 90.0     # minimum seconds between difficulty adjustments
+retarget_time = 90.0     # min seconds between difficulty adjustments
 variance_percent = 30.0  # tolerance band before retargeting
 
-# ---------------------------------------------------------------------------
-# Shared PPLNS / payout economics (public mode). Wallet addresses are per-coin
-# (below); these knobs are usually common across coins.
-# ---------------------------------------------------------------------------
+# === PPLNS / payout economics (public mode; addresses are per-coin) ========
 [public]
 fee_percent = 2.0          # pool fee -> that coin's faucet
 min_payout = 0.001         # smallest payout, in whole coins
 pplns_window = 100000      # reward split over the most-recent N shares
 payout_interval = 300      # seconds between payout sweeps
 
-# ---------------------------------------------------------------------------
-# Donation page (/donate). OpenAlias resolves to the right address per coin.
-# ---------------------------------------------------------------------------
+# === Donation page (/donate); OpenAlias resolves per coin ==================
 [donate]
 openalias = "donate@testnetpool.com"
 # bitcoin  = "bc1..."
 # litecoin = "ltc1..."
 # monero   = "4..."
 
-# ===========================================================================
-# One [[coins]] table per coin. Required: coin, chain, stratum_port, the wallet
-# addresses (public mode), and [coins.rpc]. Everything else falls back to the
-# [defaults]/[public] above. db_path defaults to "<coin>-<chain>.db".
-#
-# Each coin needs its own stratum_port and database. You can list the SAME coin
-# on different chains (e.g. monero on both testnet and stagenet) - just give
-# each its own ports. The dashboard addresses coins by slug: a lone coin keeps a
-# clean URL (/c/litecoin); duplicates become /c/monero-testnet & /c/monero-stagenet.
-#
-# To run a SINGLE coin: keep one [[coins]] entry and delete the others.
-#
-# OPTIONAL per-coin keys below are valid under ANY coin - they are shown once each,
-# under whichever coin, only to avoid repeating them. None of them is coin-specific:
-#   wallet         node wallet to pay from         (illustrated under bitcoin)
-#   explorer_url   override the block-explorer link (shown under each coin)
-#   zmq_block_url  node ZMQ block publisher         (shown under each coin)
-# (block_webhook_url and the max_conns_* caps live in [defaults] since they apply to
-# every coin, but may also be set per-coin here.)
-# ===========================================================================
+# === Coins =================================================================
+# One [[coins]] table per coin. Required: coin, chain, stratum_port, the wallet addresses (public
+# mode), and [coins.rpc]; everything else inherits [defaults]/[public]. db_path defaults to
+# "<coin>-<chain>.db". Each coin needs its own port + database; the same coin on two chains is fine
+# (the dashboard slugs them /c/monero-testnet, /c/monero-stagenet). Optional per-coin keys (valid
+# under any coin, shown once to avoid repetition): wallet, explorer_url, explorer_tx_url, zmq_block_url.
 
 [[coins]]
 coin = "bitcoin"
@@ -146,30 +74,16 @@ chain = "testnet4"
 stratum_port = 3333
 pool_address = "tb1q...POOL_ADDRESS...replace_me"
 faucet_address = "tb1q...FAUCET_ADDRESS...replace_me"
-# Node wallet to pay from (public mode). Bitcoin/Litecoin Core load multiple
-# wallets at once, so a pool sharing a node with e.g. a faucet can use its own:
-# leave blank = the node's default wallet; set a name = RPC targets /wallet/<name>.
-# (pool_address must be an address IN this wallet.)
-# wallet = "tbtc_pool"
-# Block pages already link to a default explorer (mempool.space for BTC); set
-# explorer_url only to override it for this coin/chain ({hash} is filled in).
-# explorer_url = "https://mempool.space/testnet4/block/{hash}"
-# Payout/transaction links derive their tx URL from explorer_url automatically
-# (.../block/{hash} -> .../tx/{txid}); set explorer_tx_url only for a custom explorer
-# whose tx path differs ({txid} is filled in).
-# explorer_tx_url = "https://mempool.space/testnet4/tx/{txid}"
-# Optional: the node's ZMQ block publisher (run bitcoind with
-# -zmqpubhashblock=tcp://127.0.0.1:28332) for INSTANT new-block detection without
-# holding an RPC worker open. With this set, also set longpoll = false. Pure-Python
-# ZMTP client - no extra dependency. (Same keys work under every coin.)
-# zmq_block_url = "tcp://127.0.0.1:28332"
+# wallet = "tbtc_pool"   # node wallet to pay from; blank = default wallet (pool_address must be in it)
+# explorer_url = "https://mempool.space/testnet4/block/{hash}"   # override the built-in explorer ({hash} filled)
+# explorer_tx_url = "https://mempool.space/testnet4/tx/{txid}"   # only if the tx path isn't .../tx/{txid}
+# zmq_block_url = "tcp://127.0.0.1:28332"   # node -zmqpubhashblock; instant blocks, then set longpoll = false
 [coins.rpc]
 host = "127.0.0.1"
 port = 0                   # 0 -> per-chain default (testnet4 = 48332)
 user = "bitcoinrpc"
 password = "bitcoinrpcpass"
-# Or authenticate with the node's cookie instead (leave user/password blank):
-# cookie_file = "/home/you/.bitcoin/testnet4/.cookie"
+# cookie_file = "/home/you/.bitcoin/testnet4/.cookie"   # or authenticate by cookie (leave user/password blank)
 
 [[coins]]
 coin = "litecoin"
@@ -177,57 +91,40 @@ chain = "test"
 stratum_port = 3334
 pool_address = "tltc1q...POOL_ADDRESS...replace_me"
 faucet_address = "tltc1q...FAUCET_ADDRESS...replace_me"
-# Block pages link to a block explorer out of the box (mempool.space for BTC,
-# litecoinspace.org for LTC, xmrchain for XMR). Set explorer_url only to override
-# the built-in default for this coin/chain ({hash} is filled in).
 # explorer_url = "https://litecoinspace.org/testnet/block/{hash}"
-# Optional: the node's ZMQ block publisher (run litecoind with
-# -zmqpubhashblock=tcp://127.0.0.1:28332) for INSTANT new-block detection without
-# holding an RPC worker open. With this set, also set longpoll = false (lighter on
-# a busy node). Pure-Python ZMTP client - no extra dependency.
-# zmq_block_url = "tcp://127.0.0.1:28332"
-# Lighten the pool's RPC load on a node SHARED with other services (e.g. a faucet). With ZMQ
-# above set, this collapses the pool to ~one (debounced) getblocktemplate per real block:
-# longpoll = false           # don't hold a getblocktemplate worker open continuously
-# template_refresh = 0       # rebuild ONLY when a block arrives (skip the idle ntime rebuild)
-# block_poll_interval = 30   # ZMQ detects blocks; this is just a slow safety-net tip poll
-# node_stats_interval = 300  # cache mempool/peers/tip-age/network-hashrate display this long
-# Litecoin testnet/mainnet are post-MWEB, so blocks are built as full MWEB blocks
-# automatically (see include_transactions above). MWEB addresses (ltcmweb1...)
-# are NOT valid as a pool/faucet address - a coinbase can't pay into MWEB.
+# zmq_block_url = "tcp://127.0.0.1:28333"   # litecoind's OWN port - each coin's node needs a distinct one
+# [coins.vardiff]   # scrypt sizing: the SHA-256 default (16384) is far too hard for a small scrypt rig
+# start_difficulty = 256
+# min_difficulty = 1
+# max_difficulty = 2097152
+# Lighten RPC load on a node shared with other services (e.g. a faucet); with zmq_block_url set,
+# this collapses the pool to ~one getblocktemplate per block:
+# longpoll = false
+# template_refresh = 0       # rebuild only when a block arrives (skip the idle ntime rebuild)
+# block_poll_interval = 30   # slow safety-net tip poll (ZMQ catches real blocks)
+# node_stats_interval = 300  # cache mempool/peers/tip-age/hashrate display this long
+# Litecoin is post-MWEB: MWEB addresses (ltcmweb1...) can't be a pool/faucet address.
 [coins.rpc]
 host = "127.0.0.1"
 port = 0                   # 0 -> per-chain default (litecoin test = 19332)
 user = "litecoinrpc"
 password = "litecoinrpcpass"
 
-# --- Monero -----------------------------------------------------------------
-# Monero is a separate engine: a CryptoNote Stratum server + monerod, with shares
-# accepted TRUST-BASED (monerod is the final arbiter for real blocks). This keeps
-# TestnetPool pure-Python (no RandomX dependency) and is safe where coins are
-# worthless. Do NOT use trust-based shares on mainnet. Point xmrig at the port.
-#
-# Run monerod --testnet (RPC 28081) and/or --stagenet (RPC 38081). Uncomment to
-# enable; both entries below run testnet AND stagenet at once under one dashboard.
+# === Monero (separate engine; uncomment to enable) =========================
+# CryptoNote Stratum + monerod, shares accepted TRUST-BASED (monerod is the arbiter for real
+# blocks) - keeps the pool pure-Python. Never use trust-based shares on mainnet. Run monerod
+# --testnet (RPC 28081) and/or --stagenet (RPC 38081) and point xmrig at the port. Both entries
+# below run testnet + stagenet under one dashboard.
 #
 # [[coins]]
 # coin = "monero"
 # chain = "testnet"
 # stratum_port = 3335
-# pool_address = "9...testnet address..."   # the POOL wallet's PRIMARY address (account 0)
-# faucet_address = "9...testnet faucet address..."   # just a destination; see note below
-# # Payouts go through monero-wallet-rpc; port 0 disables payouts (balances still
-# # accrue + show on the dashboard). Point monero_wallet_port at the wallet-rpc that
-# # has the POOL wallet open (one monero-wallet-rpc serves ONE wallet on ONE port,
-# # started with --wallet-file so it's already open). The pool spends from ACCOUNT 0,
-# # so pool_address MUST be that wallet's primary (account 0) address - the address
-# # monerod pays the coinbase to. The FAUCET runs its own separate wallet(s) on their
-# # OWN ports; the pool never opens them - it just sends the fee on-chain to
-# # faucet_address each round. So with 2 faucet wallets + 1 pool wallet, the pool
-# # config references only the pool wallet-rpc (port below) + the faucet's address.
+# pool_address = "9...testnet address..."           # the POOL wallet's PRIMARY (account 0) address
+# faucet_address = "9...testnet faucet address..."   # fee destination (the pool just sends to it)
 # monero_wallet_host = "127.0.0.1"
-# monero_wallet_port = 0     # e.g. 28083 -> the POOL wallet-rpc (not a faucet one)
-# # monero_wallet_user = ""  # only if wallet-rpc runs with --rpc-login
+# monero_wallet_port = 0     # POOL wallet-rpc port (e.g. 28083); 0 disables payouts (balances still accrue)
+# # monero_wallet_user = ""       # only if wallet-rpc runs with --rpc-login
 # # monero_wallet_password = ""
 # [coins.rpc]
 # host = "127.0.0.1"

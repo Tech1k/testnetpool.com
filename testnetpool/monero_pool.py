@@ -37,6 +37,8 @@ log = logging.getLogger("testnetpool.monero")
 POLL_INTERVAL_FLOOR = 5.0  # seconds; Monero blocks are ~2 min, no need to poll fast
 MAX_RECIPIENTS = 15        # cap payouts per sweep; the rest roll to the next round
 SHARES_RETENTION_SECONDS = 35 * 86400  # bound the shares table (see pool.SHARES_RETENTION_SECONDS)
+PRUNE_CHUNK = 20000               # rows per DELETE (see pool.PRUNE_CHUNK)
+PRUNE_MAX_CHUNKS_PER_TICK = 100   # backstop per maintenance tick (see pool.PRUNE_MAX_CHUNKS_PER_TICK)
 REORG_TOLERANCE = 6        # depth-grace before orphaning (see pool.REORG_TOLERANCE)
 FEE_RESERVE_PICO = 10 ** 9  # ~0.001 XMR held back so a max-balance payout still covers the fee
 
@@ -74,7 +76,9 @@ class MoneroPool:
         self.node_health = {}        # {peers, tip_age_seconds, synced} - for the dashboard
         self._last_health_ts = 0.0   # throttle the node-health probe
         self.template: MoneroJob | None = None
-        self.last_template_ts = 0.0  # set on each template; powers the /healthz probe
+        self.last_template_ts = 0.0  # set on each new template; the dashboard's template age
+        self.last_node_contact = 0.0  # last successful monerod poll (steady heartbeat); /healthz
+        #                               keys on THIS so a long inter-block gap isn't read as dead
         # Pool-GLOBAL trust-share dedup. Trust-based acceptance takes the result at
         # face value, so a miner who finds ONE valid result must not be able to credit
         # it more than once - not by re-fetching getjob for a fresh job_id (same
@@ -107,6 +111,10 @@ class MoneroPool:
         # the overlap just costs a little redundant work, never funds. A real PoW pool
         # would request reserve_size>0 and splice a unique extra-nonce per connection.
         gbt = await self.rpc.get_block_template(self.cfg.coinbase_address, 0)
+        # The node answered: liveness heartbeat, stamped on EVERY poll BEFORE parsing/the monotonic
+        # guard, so a malformed-but-200 template or an out-of-order older fetch still counts as a
+        # live node (mirrors the BTC/LTC interval poll). /healthz keys on this, not last_template_ts.
+        self.last_node_contact = time.time()
         job = MoneroJob(gbt)
         prev = self.current_height
         new_height = job.height - 1  # the block being mined is the next height
@@ -341,8 +349,19 @@ class MoneroPool:
                         cutoff, self.cfg.public.faucet_address, time.time())
                     if swept:
                         log.info("monero: swept %d base units of idle balances to the faucet", swept)
-                    pruned = self.accounting.prune_shares(
-                        int(time.time() - SHARES_RETENTION_SECONDS), self.cfg.public.pplns_window)
+                    # Drain in chunks, yielding between each, so a large first-time backlog can't
+                    # stall share handling in one long DELETE (parity with the BTC/LTC engine).
+                    cutoff_ts = int(time.time() - SHARES_RETENTION_SECONDS)
+                    pruned = 0
+                    floor_id = self.accounting.shares_keep_floor(self.cfg.public.pplns_window)
+                    for _ in range(PRUNE_MAX_CHUNKS_PER_TICK if floor_id is not None else 0):
+                        n = self.accounting.prune_shares(
+                            cutoff_ts, self.cfg.public.pplns_window, chunk=PRUNE_CHUNK,
+                            floor_id=floor_id)
+                        pruned += n
+                        if n < PRUNE_CHUNK:
+                            break
+                        await asyncio.sleep(0)
                     if pruned:
                         log.info("monero: pruned %d shares older than %d days", pruned,
                                  SHARES_RETENTION_SECONDS // 86400)

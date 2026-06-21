@@ -108,7 +108,12 @@ class Pool:
         self._best_hash = ""
         self._running = False
         self._mweb_upgrade_logged = False  # one-shot notice when MWEB forces full blocks
-        self.last_template_ts = 0.0  # set on each template; powers the /healthz probe
+        self.last_template_ts = 0.0  # set on each successful build; the dashboard's template age
+        self.last_node_contact = 0.0  # last successful node poll (steady heartbeat, even between
+        #                               blocks); /healthz keys on THIS so a long inter-block gap
+        #                               with template_refresh=0 isn't mistaken for a dead node
+        self._stats_refreshing = False  # a node-stats display refresh task is in flight
+        self._stats_task = None         # hold a ref so the fire-and-forget task isn't GC'd
         self.mempool = None  # {txs, vbytes, total_fee} - node mempool depth, for the API
         self._template_lock = asyncio.Lock()  # serialize template application (poll + ZMQ)
         # Broadcasting the new job to every miner happens OUTSIDE the template lock (a slow
@@ -283,44 +288,18 @@ class Pool:
     # -- template polling ----------------------------------------------------
 
     async def _apply_template(self, gbt: dict, clean: bool) -> None:
-        self.last_template_ts = time.time()
-        # Node-stats refresh (mempool depth, peers, tip age, network hashrate) - all best-effort
-        # DISPLAY fields. Throttle to ONE batch every 30s instead of probing on EVERY template:
-        # on a fast-moving chain (e.g. a min-difficulty testnet) the template rebuilds on every
-        # block, and an unthrottled probe would hammer the node's limited -rpcthreads. Any
-        # failure here is swallowed - it must never block or break template/block handling.
-        now = time.time()
-        if now - self._last_health_ts >= self.cfg.node_stats_interval:
-            self._last_health_ts = now
-            try:
-                mp = await self.rpc.get_mempool_info(timeout=10)
-                self.mempool = {"txs": mp.get("size"), "vbytes": mp.get("bytes"),
-                                "total_fee": mp.get("total_fee")}
-            except Exception:
-                log.debug("mempool refresh failed", exc_info=True)
-            try:
-                info = await self.rpc.get_blockchain_info(timeout=10)
-                peers = await self.rpc.get_connection_count(timeout=10)
-                tip_time = info.get("time") or info.get("mediantime")
-                self.node_health = {
-                    "peers": peers,
-                    "tip_age_seconds": max(0, int(now) - tip_time) if tip_time else None,
-                    "synced": (info.get("blocks") == info.get("headers")
-                               if info.get("headers") else None),
-                }
-            except Exception:
-                log.debug("node health refresh failed", exc_info=True)
-            # Network hashrate straight from the node (work over actual block times -
-            # what mempool.space/Core show). Kept separate so a failure here doesn't lose
-            # node_health; on failure the dashboard falls back to the difficulty estimate.
-            try:
-                self.network_hashps = float(await self.rpc.get_network_hashps(timeout=10))
-            except Exception:
-                log.debug("getnetworkhashps refresh failed", exc_info=True)
         self._job_counter += 1
         job_id = f"{self._job_counter:016x}"  # 16-hex, ckpool's %016lx width
+        # build() FIRST: it validates the template (a parseable-but-malformed 200 response raises
+        # here, caught by _ingest_template) BEFORE any job-state or liveness mutation - so a run
+        # of bad-but-200 templates can't advance the health timestamps while producing no job.
         job = self.builder.build(gbt, job_id)
         job.created = time.time()  # wall-clock, for age-based retention below
+        # Stamp liveness only after a successful build. last_node_contact is ALSO stamped on every
+        # bare tip poll (_interval_loop), so /healthz stays green across a long inter-block gap
+        # even when template_refresh=0 (no idle rebuild) keeps last_template_ts old.
+        self.last_template_ts = job.created
+        self.last_node_contact = job.created
         # If the operator asked for coinbase-only blocks but the chain is post-MWEB,
         # the builder upgrades to a full block (a coinbase-only block would be
         # rejected "mweb-missing"). Tell the operator once so the override is visible.
@@ -359,6 +338,48 @@ class Pool:
             f"{netdiff:,.2f}" if netdiff < 1000 else f"{netdiff:,.0f}",
             job.nbits_hex, job.curtime,
         )
+        # Refresh the best-effort DISPLAY fields (mempool/peers/tip-age/net-hashrate) OFF the
+        # template critical path: a slow node's stats RPCs must never delay this job's broadcast.
+        # Throttled to node_stats_interval and guarded so refreshes can't pile up.
+        if (now - self._last_health_ts >= self.cfg.node_stats_interval
+                and not self._stats_refreshing):
+            self._last_health_ts = now
+            self._stats_refreshing = True
+            self._stats_task = asyncio.create_task(self._refresh_node_stats())
+
+    async def _refresh_node_stats(self) -> None:
+        """Best-effort DISPLAY fields (mempool depth, peers, tip age, network hashrate). Runs as
+        its own task, OFF the template critical path, so a slow node can't delay job broadcast;
+        each probe failure is swallowed and leaves the last value in place. Throttled by the
+        caller (node_stats_interval) and serialized by self._stats_refreshing."""
+        try:
+            now = time.time()
+            try:
+                mp = await self.rpc.get_mempool_info(timeout=10)
+                self.mempool = {"txs": mp.get("size"), "vbytes": mp.get("bytes"),
+                                "total_fee": mp.get("total_fee")}
+            except Exception:
+                log.debug("mempool refresh failed", exc_info=True)
+            try:
+                info = await self.rpc.get_blockchain_info(timeout=10)
+                peers = await self.rpc.get_connection_count(timeout=10)
+                tip_time = info.get("time") or info.get("mediantime")
+                self.node_health = {
+                    "peers": peers,
+                    "tip_age_seconds": max(0, int(now) - tip_time) if tip_time else None,
+                    "synced": (info.get("blocks") == info.get("headers")
+                               if info.get("headers") else None),
+                }
+            except Exception:
+                log.debug("node health refresh failed", exc_info=True)
+            # Network hashrate straight from the node (work over actual block times - what
+            # mempool.space/Core show). Separate try so its failure doesn't lose node_health.
+            try:
+                self.network_hashps = float(await self.rpc.get_network_hashps(timeout=10))
+            except Exception:
+                log.debug("getnetworkhashps refresh failed", exc_info=True)
+        finally:
+            self._stats_refreshing = False
 
     async def _broadcast(self, job: Job, clean: bool) -> None:
         subs = [c for c in list(self.connections) if c.subscribed]
@@ -385,6 +406,15 @@ class Pool:
         pending = None
         async with self._template_lock:
             try:
+                # Drop an out-of-order OLDER template. The poll loop and the ZMQ callback fetch
+                # concurrently OUTSIDE this lock, so a slower fetch for a now-superseded tip can
+                # resolve last; applying it would regress current_height/_best_hash, briefly admit
+                # superseded-tip shares to PPLNS, and rebroadcast a stale clean job. (Mirrors the
+                # Monero engine's monotonic height guard.) Same-height refreshes still pass.
+                new_height = gbt.get("height")
+                if (self.current_height is not None and new_height is not None
+                        and new_height < self.current_height):
+                    return
                 is_new = gbt["previousblockhash"] != self._best_hash
                 await self._apply_template(gbt, clean=is_new)
                 self._best_hash = gbt["previousblockhash"]
@@ -510,6 +540,10 @@ class Pool:
             except RPCError as exc:
                 log.error("cannot reach node: %s", exc)
                 continue
+            # The node answered: this is the steady liveness heartbeat (even when the tip hasn't
+            # changed and we don't rebuild), so /healthz doesn't read a long inter-block gap as a
+            # dead node under template_refresh=0.
+            self.last_node_contact = time.time()
             now = time.monotonic()
             # Always rebuild on a tip change. The idle rebuild (refresh ntime/mempool fees)
             # fires only every template_refresh seconds; set template_refresh <= 0 to disable it
@@ -630,9 +664,11 @@ class Pool:
                     # share validation in one long DELETE; the per-tick cap bounds the rest.
                     cutoff_ts = int(time.time() - SHARES_RETENTION_SECONDS)
                     pruned = 0
-                    for _ in range(PRUNE_MAX_CHUNKS_PER_TICK):
+                    floor_id = self.accounting.shares_keep_floor(self.cfg.public.pplns_window)
+                    for _ in range(PRUNE_MAX_CHUNKS_PER_TICK if floor_id is not None else 0):
                         n = self.accounting.prune_shares(
-                            cutoff_ts, self.cfg.public.pplns_window, chunk=PRUNE_CHUNK)
+                            cutoff_ts, self.cfg.public.pplns_window, chunk=PRUNE_CHUNK,
+                            floor_id=floor_id)
                         pruned += n
                         if n < PRUNE_CHUNK:  # short read => backlog drained
                             break
@@ -857,6 +893,15 @@ class Pool:
             # the DB - otherwise it resumes after close() on a dead connection.
             if bg_tasks:
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
+            # Also cancel the fire-and-forget side tasks (node-stats refresh + block webhooks).
+            # They only touch display fields / external POSTs, never the DB, but cancelling them
+            # avoids a "Task was destroyed but it is pending" warning and a lingering RPC await.
+            side = [t for t in (self._stats_task, *self._webhook_tasks)
+                    if t is not None and not t.done()]
+            for t in side:
+                t.cancel()
+            if side:
+                await asyncio.gather(*side, return_exceptions=True)
             await self.stratum.close()
             if self.stats_server is not None:
                 await self.stats_server.close()

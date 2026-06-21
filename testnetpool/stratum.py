@@ -376,8 +376,8 @@ class MinerConnection:
         self.user_agent = ""      # self-reported miner UA from mining.subscribe
         self.best = 0.0           # best (highest-difficulty) share this session
         self.vardiff = Vardiff(pool.cfg.vardiff, time.time())
-        self._seen: "OrderedDict[tuple, None]" = OrderedDict()  # sliding-window dedup
-        #   keyed on (job_id, en2, ntime, nonce, version); NOT reset on job change (see _on_submit)
+        self._seen: "OrderedDict[bytes, None]" = OrderedDict()  # sliding-window dedup, keyed on
+        #   the 80-byte PoW header (build_header), NOT job_id; NOT reset on job change (see _on_submit)
         self.accepted = 0
         self.rejected = 0
         self._jobs_sent = 0  # mining.notify count, for the disconnect diagnostic
@@ -745,25 +745,29 @@ class MinerConnection:
             await self.reject(msg_id, ERR_OTHER, "ntime out of range", now)
             return
 
-        # Duplicate detection. Key on the PARSED values, not the raw hex, so re-encodings of
-        # one solution ("1f"/"0x1f"/"0000001f") can't bypass dedup and inflate PPLNS weight.
-        # The key includes job_id, so distinct jobs never collide - and we must NOT clear the
-        # set on a job change: with job retention many same-tip jobs are live at once, so
-        # clearing on every switch would let a miner re-credit one already-counted share by
-        # ping-ponging job_ids (submit S on A -> any share on B clears the set -> re-submit S
-        # on A, now forgotten -> credited twice). The sliding MAX_SEEN_SHARES window below
-        # bounds memory instead; the oldest key is only ever evicted after 100k newer shares.
-        share_key = (job_id, extranonce2, ntime, nonce, version)
-        if share_key in self._seen:
+        # Duplicate detection. Key on the actual PoW identity - the 80-byte header - NOT on the
+        # job_id. job_id and the template's curtime are NOT part of the header, so an idle
+        # same-tip rebuild mints a fresh job_id over byte-identical work; keying on job_id would
+        # let one physical solution be resubmitted under each retained same-tip job and credited
+        # as N PPLNS shares (payout theft). The header encodes version/prevhash/merkleroot/ntime/
+        # nbits/nonce - everything the PoW depends on - and extranonce1 is fixed per connection
+        # (this _seen set is per connection), so two submissions are duplicates iff their headers
+        # match. This also subsumes re-encoding bypasses (the parsed nonce/ntime serialize
+        # identically) and mirrors the Monero path, which keys on the blockhashing blob. We must
+        # NOT clear _seen on a job change: with job retention many same-tip jobs are live at once,
+        # and clearing would let a miner re-credit an already-counted share by ping-ponging jobs.
+        # The sliding MAX_SEEN_SHARES window bounds memory; the oldest key is evicted only after
+        # 100k newer shares. The header is built here (cheap) and reused for the PoW hash below.
+        header = job.build_header(self.extranonce1, extranonce2, ntime, nonce, version)
+        if header in self._seen:
             await self.reject(msg_id, ERR_DUPLICATE, "duplicate share", now)
             return
-        self._seen[share_key] = None
+        self._seen[header] = None
         if len(self._seen) > MAX_SEEN_SHARES:
             self._seen.popitem(last=False)  # evict OLDEST (sliding window, not a full reset
             #                                  that would forget recent shares -> re-credit)
 
         # Compute the PoW hash (coin-specific: scrypt for LTC, sha256d for BTC).
-        header = job.build_header(self.extranonce1, extranonce2, ntime, nonce, version)
         pow_hash = self.pool.coin.pow_hash(header)
         hash_int = util.hash_int_le(pow_hash)
         share_diff = self.pool.coin.hash_to_difficulty(pow_hash)

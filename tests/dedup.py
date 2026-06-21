@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Tech1k <https://tech1k.com>
-"""Regression: per-connection duplicate-share detection keys on PARSED values.
+"""Regression: per-connection duplicate-share detection keys on the PoW header.
 
-A miner that submits one solution re-encoded ("00000001" / "1" / "0x1" / "0X01")
-must NOT be able to inflate its PPLNS weight by having each spelling counted as a
-distinct share.  The fix keys the dedup set on the parsed (extranonce2, ntime,
-nonce, version) tuple rather than the raw hex strings; this test drives
-MinerConnection._on_submit directly and asserts every re-encoding of an accepted
-share is rejected as a duplicate, while a genuinely different nonce still passes.
+A miner that submits one physical solution must NOT inflate its PPLNS weight by
+having it counted as several shares. Dedup keys on the 80-byte block header (the
+canonical PoW identity), so neither re-encoding the nonce ("00000001" / "1" /
+"0x1") nor replaying the SAME solution under a fresh same-tip job_id (an idle
+template rebuild mints new job_ids over byte-identical work) gets credited twice;
+a genuinely different nonce still passes. This test drives
+MinerConnection._on_submit directly. It also covers H-1 (a job switch must not
+clear the dedup window) and B1 (a superseded-tip share is stale even while
+_best_hash is transiently blank).
 
 Run:  python3 tests/dedup.py
 """
@@ -141,12 +144,13 @@ async def main() -> int:
     ).fetchone()[0]
     ok.append(("only 2 distinct shares credited", n_shares == 2))
 
-    # --- H-1 regression: job retention must NOT re-open the per-connection dedup window ---
-    # With many same-tip jobs live at once, the dedup set must NOT be cleared when a
-    # connection submits to a DIFFERENT job_id. Otherwise a miner re-credits one already-
-    # counted valid share by ping-ponging job_ids: submit S on A, any share on B (which used
-    # to clear _seen), then re-submit S on A - now forgotten, so credited twice. Mint a second
-    # same-tip job B (same prevhash => passes the stale gate) and drive A -> B -> A.
+    # --- CRITICAL: dedup keys on the PoW identity (the header), not job_id ---
+    # With job retention many same-tip jobs are live at once; an idle rebuild mints a fresh
+    # job_id over byte-identical work (job_id and the template curtime are NOT in the header),
+    # so keying on job_id let one physical solution be resubmitted under each same-tip job and
+    # credited as N PPLNS shares (payout theft). Mint a second same-tip job B (same prevhash =>
+    # same coinbase/merkle => identical header for a given nonce) and confirm the same solution
+    # under B's job_id is a duplicate.
     gbt2 = await pool.rpc.get_block_template()
     await pool._ingest_template(gbt2)
     job_b_id = pool.current_job_id            # capture synchronously (poll loop may add more)
@@ -165,22 +169,32 @@ async def main() -> int:
         await conn._on_submit(msg_id, [MINER_ADDR, job_id, en2_hex, ntime_h, nonce_hex])
         return writer.last()
 
-    S = "00000007"                             # a nonce not yet seen on job A
+    S = "00000007"                             # a nonce not yet seen
     rA = await submit_job(10, job.job_id, ntime_hex, S)
-    ok.append(("replay setup: share S on job A accepted", rA.get("result") is True))
-    rB = await submit_job(11, job_b_id, ntime_b, S)   # switch job_id (the old clear() trigger)
-    ok.append(("share on job B accepted (distinct key)", rB.get("result") is True))
-    rA2 = await submit_job(12, job.job_id, ntime_hex, S)   # replay S on A
+    ok.append(("share S on job A accepted", rA.get("result") is True))
+    # The SAME physical PoW (same en2/ntime/nonce, identical same-tip coinbase) under job B's id
+    # MUST be a duplicate - the same-tip replay the old job_id-keyed set wrongly allowed.
+    rB = await submit_job(11, job_b_id, ntime_b, S)
+    errB = rB.get("error")
+    ok.append(("same-tip replay of S under job B rejected as duplicate",
+               rB.get("result") is False and isinstance(errB, list) and errB[0] == ERR_DUPLICATE))
+
+    # H-1: a job switch must NOT clear the dedup window. A genuinely different nonce T on B is
+    # accepted (it was the old clear() trigger); re-submitting S on A afterwards is still a dup.
+    T = "00000008"
+    rT = await submit_job(12, job_b_id, ntime_b, T)
+    ok.append(("distinct nonce T on job B accepted", rT.get("result") is True))
+    rA2 = await submit_job(13, job.job_id, ntime_hex, S)
     errA2 = rA2.get("error")
-    ok.append(("A->B->A replay of S on job A rejected as duplicate",
-               rA2.get("result") is False and isinstance(errA2, list)
-               and errA2[0] == ERR_DUPLICATE))
+    ok.append(("replay of S on job A still rejected (dedup window not cleared)",
+               rA2.get("result") is False and isinstance(errA2, list) and errA2[0] == ERR_DUPLICATE))
 
     await asyncio.sleep(0.05)
     n_after = pool.accounting.conn.execute(
         "SELECT COUNT(*) FROM shares s JOIN miners m ON m.id=s.miner_id WHERE m.address=?",
         (MINER_ADDR,)).fetchone()[0]
-    ok.append(("replay credited exactly 2 shares (S on A + S on B), not 3",
+    # S is credited once despite three submissions across two job_ids; T once. Total 2, not 3.
+    ok.append(("same-tip replay added no extra credit (S once + T = 2)",
                n_after - n_before == 2))
 
     # --- B1 regression: a non-block share for a SUPERSEDED (lower-height) tip is rejected as

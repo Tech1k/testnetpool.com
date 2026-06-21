@@ -822,7 +822,8 @@ def test_transparency_api():
 
     class _Pool:
         cfg = _Cfg(); coin = _Coin(); accounting = None; connections = {conn}; current_height = 5
-        last_template_ts = _t.time(); mempool = {"txs": 1247, "vbytes": 5000, "total_fee": 0.05}
+        last_template_ts = _t.time(); last_node_contact = _t.time()
+        mempool = {"txs": 1247, "vbytes": 5000, "total_fee": 0.05}
         bans = BanManager()
         def current_job(self): return None  # noqa: E704
     p = _Pool(); p.stats = Stats(p)
